@@ -13,13 +13,28 @@ import {
   Platform,
   TextInput,
   FlatList,
+  Switch,
 } from 'react-native';
 import DocumentScanner from 'react-native-document-scanner-plugin';
 import RNPrint from 'react-native-print';
 import Share from 'react-native-share';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { classifyDocumentType, DocumentType } from './utils/classifyDocument';
+import { exportSearchablePDF } from './utils/pdfExport';
+import DrawingPadScreen from './utils/DrawingPadScreen';
 
-type Screen = 'idle' | 'result' | 'history';
+
+type Screen = 'idle' | 'result' | 'history' | 'drawing';
+type Language = 'latin' | 'chinese' | 'devanagari' | 'japanese' | 'korean';
+
+const LANGUAGE_OPTIONS: { key: Language; label: string }[] = [
+  { key: 'latin', label: 'Latin' },
+  { key: 'chinese', label: 'Chinese' },
+  { key: 'devanagari', label: 'Devanagari' },
+  { key: 'japanese', label: 'Japanese' },
+  { key: 'korean', label: 'Korean' },
+];
 
 type HistoryEntry = {
   id: string;
@@ -27,12 +42,18 @@ type HistoryEntry = {
   pageCount: number;
   textPreview: string;
   pdfPath: string;
+  thumbnail: string;
+  docType: DocumentType;
 };
 
 const HISTORY_KEY = 'docscanner_history';
 
 function App(): React.JSX.Element {
   const [screen, setScreen] = useState<Screen>('idle');
+
+  // --- Scan settings ---
+  const [language, setLanguage] = useState<Language>('latin');
+  const [enhanceImage, setEnhanceImage] = useState(false);
 
   // --- Multi-page scan state ---
   const [scannedImages, setScannedImages] = useState<string[]>([]);
@@ -42,6 +63,7 @@ function App(): React.JSX.Element {
 
   // --- History state ---
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [filterType, setFilterType] = useState<'All' | DocumentType>('All');
 
   const requestCameraPermission = async () => {
     if (Platform.OS !== 'android') return true;
@@ -65,7 +87,6 @@ function App(): React.JSX.Element {
     }
 
     try {
-      // maxNumDocuments is set high so the user can scan multiple pages in one session
       const { scannedImages: images } = await DocumentScanner.scanDocument({
         maxNumDocuments: 10,
       });
@@ -88,7 +109,11 @@ function App(): React.JSX.Element {
     try {
       const pageTexts: string[] = [];
       for (let i = 0; i < images.length; i++) {
-        const result = await NativeModules.TextRecognizer.recognizeText(images[i]);
+        const result = await NativeModules.TextRecognizer.recognizeText(
+          images[i],
+          language,
+          enhanceImage,
+        );
         const pageText = result.fullText || '(No text found on this page)';
         pageTexts.push(
           images.length > 1 ? `--- Page ${i + 1} ---\n${pageText}` : pageText,
@@ -109,7 +134,7 @@ function App(): React.JSX.Element {
     setScreen('idle');
   };
 
-  // ---------- Export PDF (uses the edited text) ----------
+  // ---------- Export PDF ----------
   const handleExportPDF = async () => {
     if (!extractedText) return;
     try {
@@ -136,11 +161,55 @@ function App(): React.JSX.Element {
     }
   };
 
+  // ---------- Export Searchable PDF (OCR text embedded) ----------
+  const buildPagesForPdf = (): { imageUri: string; text: string }[] => {
+    if (scannedImages.length <= 1) {
+      return [{ imageUri: scannedImages[0], text: extractedText }];
+    }
+    const parts = extractedText.split(/--- Page \d+ ---\n?/).filter(Boolean);
+    return scannedImages.map((img, i) => ({
+      imageUri: img,
+      text: parts[i] || '',
+    }));
+  };
+
+  const handleExportSearchablePDF = async () => {
+    if (!extractedText) return;
+    try {
+      const pages = buildPagesForPdf();
+      const filePath = await exportSearchablePDF(pages);
+      setPdfPath(filePath);
+      await saveToHistory(filePath);
+      Alert.alert('Searchable PDF Created!', `Saved to:\n${filePath}`);
+    } catch (error: any) {
+      Alert.alert('PDF Error', error.message || 'Could not create searchable PDF');
+    }
+  };
+
   const handleSharePDF = async (path: string) => {
     try {
       await Share.open({
         url: `file://${path}`,
         type: 'application/pdf',
+      });
+    } catch (error) {
+      // User cancelled the share sheet, ignore
+    }
+  };
+
+  // ---------- Copy text / export as .txt ----------
+  const handleCopyText = () => {
+    if (!extractedText) return;
+    Clipboard.setString(extractedText);
+    Alert.alert('Copied', 'Extracted text copied to clipboard');
+  };
+
+  const handleExportTxt = async () => {
+    if (!extractedText) return;
+    try {
+      await Share.open({
+        message: extractedText,
+        title: 'Scanned Text',
       });
     } catch (error) {
       // User cancelled the share sheet, ignore
@@ -168,6 +237,8 @@ function App(): React.JSX.Element {
         pageCount: scannedImages.length,
         textPreview: extractedText.slice(0, 100),
         pdfPath: path,
+        thumbnail: scannedImages[0],
+        docType: classifyDocumentType(extractedText),
       };
 
       const updated = [entry, ...existing];
@@ -175,6 +246,23 @@ function App(): React.JSX.Element {
     } catch (error) {
       // Don't crash the app if history fails to save
     }
+  };
+
+  const deleteHistoryEntry = async (id: string) => {
+    try {
+      const updated = history.filter(item => item.id !== id);
+      await AsyncStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
+      setHistory(updated);
+    } catch (error) {
+      Alert.alert('Delete Error', 'Could not delete this entry');
+    }
+  };
+
+  const confirmDelete = (id: string) => {
+    Alert.alert('Delete Scan', 'Remove this scan from history?', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: () => deleteHistoryEntry(id) },
+    ]);
   };
 
   const openHistory = () => {
@@ -185,21 +273,74 @@ function App(): React.JSX.Element {
   // ---------- SCREEN: Idle ----------
   if (screen === 'idle') {
     return (
-      <View style={styles.center}>
+      <ScrollView contentContainerStyle={styles.centerScroll}>
         <Text style={styles.title}>📄 DocScanner</Text>
         <Text style={styles.subtitle}>Scan a document, edit the text, export as PDF</Text>
+
+        <View style={styles.settingsBox}>
+          <Text style={styles.settingsLabel}>OCR Language</Text>
+          <View style={styles.languageRow}>
+            {LANGUAGE_OPTIONS.map(opt => (
+              <TouchableOpacity
+                key={opt.key}
+                style={[
+                  styles.languageChip,
+                  language === opt.key && styles.languageChipActive,
+                ]}
+                onPress={() => setLanguage(opt.key)}
+              >
+                <Text
+                  style={[
+                    styles.languageChipText,
+                    language === opt.key && styles.languageChipTextActive,
+                  ]}
+                >
+                  {opt.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          <View style={styles.enhanceRow}>
+            <Text style={styles.settingsLabel}>Enhance Image (grayscale + contrast)</Text>
+            <Switch value={enhanceImage} onValueChange={setEnhanceImage} />
+          </View>
+        </View>
+
         <TouchableOpacity style={styles.scanButton} onPress={handleScanDocument}>
           <Text style={styles.scanButtonText}>📷 Scan Document</Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.historyLinkButton} onPress={openHistory}>
           <Text style={styles.historyLinkText}>🕘 Scan History</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={styles.historyLinkButton} onPress={() => setScreen('drawing')}>
+          <Text style={styles.historyLinkText}>✍️ Handwriting Pad</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    );
+  }
+
+  // ---------- SCREEN: Drawing Pad ----------
+  if (screen === 'drawing') {
+    return (
+      <View style={{ flex: 1, backgroundColor: '#111' }}>
+        <View style={styles.historyHeader}>
+          <TouchableOpacity onPress={() => setScreen('idle')}>
+            <Text style={styles.backText}>← Back</Text>
+          </TouchableOpacity>
+          <Text style={styles.historyHeaderTitle}>Handwriting Pad</Text>
+        </View>
+        <DrawingPadScreen />
       </View>
     );
   }
 
   // ---------- SCREEN: History ----------
   if (screen === 'history') {
+    const filteredHistory = history.filter(
+      item => filterType === 'All' || item.docType === filterType,
+    );
+
     return (
       <View style={styles.resultContainer}>
         <View style={styles.historyHeader}>
@@ -209,28 +350,62 @@ function App(): React.JSX.Element {
           <Text style={styles.historyHeaderTitle}>Scan History</Text>
         </View>
 
-        {history.length === 0 ? (
+        <View style={{ flexDirection: 'row', paddingHorizontal: 16, marginBottom: 8 }}>
+          {(['All', 'Receipt', 'ID Card', 'Document'] as const).map(type => (
+            <TouchableOpacity
+              key={type}
+              onPress={() => setFilterType(type)}
+              style={{
+                paddingVertical: 6,
+                paddingHorizontal: 12,
+                marginRight: 8,
+                borderRadius: 16,
+                backgroundColor: filterType === type ? '#FFD60A' : '#333',
+              }}>
+              <Text style={{ color: filterType === type ? '#000' : '#ccc', fontSize: 12, fontWeight: '600' }}>
+                {type}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {filteredHistory.length === 0 ? (
           <View style={styles.center}>
             <Text style={styles.subtitle}>No scans yet</Text>
           </View>
         ) : (
           <FlatList
-            data={history}
+            data={filteredHistory}
             keyExtractor={item => item.id}
             contentContainerStyle={{ padding: 16 }}
             renderItem={({ item }) => (
               <View style={styles.historyCard}>
-                <Text style={styles.historyDate}>{item.date}</Text>
-                <Text style={styles.historyPages}>{item.pageCount} page(s)</Text>
-                <Text style={styles.historyPreview} numberOfLines={2}>
-                  {item.textPreview}
-                </Text>
-                <TouchableOpacity
-                  style={styles.historyShareButton}
-                  onPress={() => handleSharePDF(item.pdfPath)}
-                >
-                  <Text style={styles.actionButtonText}>📤 Share PDF</Text>
-                </TouchableOpacity>
+                <View style={styles.historyCardRow}>
+                  {item.thumbnail ? (
+                    <Image source={{ uri: item.thumbnail }} style={styles.historyThumbnail} />
+                  ) : null}
+                  <View style={styles.historyCardInfo}>
+                    <Text style={styles.historyDate}>{item.date}</Text>
+                    <Text style={styles.historyPages}>{item.pageCount} page(s) · {item.docType}</Text>
+                    <Text style={styles.historyPreview} numberOfLines={2}>
+                      {item.textPreview}
+                    </Text>
+                  </View>
+                </View>
+                <View style={styles.historyButtonRow}>
+                  <TouchableOpacity
+                    style={[styles.historyActionButton, styles.historyShareButton]}
+                    onPress={() => handleSharePDF(item.pdfPath)}
+                  >
+                    <Text style={styles.actionButtonText}>📤 Share</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.historyActionButton, styles.historyDeleteButton]}
+                    onPress={() => confirmDelete(item.id)}
+                  >
+                    <Text style={styles.actionButtonText}>🗑️ Deleted</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             )}
           />
@@ -276,9 +451,27 @@ function App(): React.JSX.Element {
           <Text style={styles.actionButtonText}>🔄 Rescan</Text>
         </TouchableOpacity>
 
+        {extractedText !== '' && (
+          <TouchableOpacity style={styles.actionButton} onPress={handleCopyText}>
+            <Text style={styles.actionButtonText}>📋 Copy Text</Text>
+          </TouchableOpacity>
+        )}
+
+        {extractedText !== '' && (
+          <TouchableOpacity style={styles.actionButton} onPress={handleExportTxt}>
+            <Text style={styles.actionButtonText}>📝 Share as Text</Text>
+          </TouchableOpacity>
+        )}
+
         {extractedText !== '' && !pdfPath && (
           <TouchableOpacity style={[styles.actionButton, styles.pdfButton]} onPress={handleExportPDF}>
             <Text style={styles.actionButtonText}>📥 Export PDF</Text>
+          </TouchableOpacity>
+        )}
+
+        {extractedText !== '' && !pdfPath && (
+          <TouchableOpacity style={[styles.actionButton, styles.pdfButton]} onPress={handleExportSearchablePDF}>
+            <Text style={styles.actionButtonText}>🔍 Searchable PDF</Text>
           </TouchableOpacity>
         )}
 
@@ -303,6 +496,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
     paddingHorizontal: 24,
   },
+  centerScroll: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#000',
+    paddingHorizontal: 24,
+    paddingVertical: 40,
+  },
   title: {
     color: '#fff',
     fontSize: 26,
@@ -312,8 +513,49 @@ const styles = StyleSheet.create({
   subtitle: {
     color: '#aaa',
     fontSize: 14,
-    marginBottom: 30,
+    marginBottom: 24,
     textAlign: 'center',
+  },
+  settingsBox: {
+    width: '100%',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 24,
+  },
+  settingsLabel: {
+    color: '#FFD60A',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 10,
+  },
+  languageRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 16,
+  },
+  languageChip: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    backgroundColor: '#222',
+  },
+  languageChipActive: {
+    backgroundColor: '#FFD60A',
+  },
+  languageChipText: {
+    color: '#ccc',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  languageChipTextActive: {
+    color: '#000',
+  },
+  enhanceRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
   },
   scanButton: {
     backgroundColor: '#FFD60A',
@@ -422,6 +664,20 @@ const styles = StyleSheet.create({
     padding: 14,
     marginBottom: 12,
   },
+  historyCardRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
+  },
+  historyThumbnail: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+    backgroundColor: '#000',
+  },
+  historyCardInfo: {
+    flex: 1,
+  },
   historyDate: {
     color: '#FFD60A',
     fontSize: 13,
@@ -436,13 +692,22 @@ const styles = StyleSheet.create({
   historyPreview: {
     color: '#ddd',
     fontSize: 13,
-    marginBottom: 10,
   },
-  historyShareButton: {
-    backgroundColor: '#00BFFF',
+  historyButtonRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  historyActionButton: {
+    flex: 1,
     paddingVertical: 10,
     borderRadius: 8,
     alignItems: 'center',
+  },
+  historyShareButton: {
+    backgroundColor: '#00BFFF',
+  },
+  historyDeleteButton: {
+    backgroundColor: '#B00020',
   },
 });
 
